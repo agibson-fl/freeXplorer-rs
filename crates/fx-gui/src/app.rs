@@ -14,7 +14,7 @@ use crate::model::{
     suggested_backup_name,
 };
 use crate::theme::{self, Palette};
-use crate::{settings, ui};
+use crate::{logging, settings, ui};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DriverState {
@@ -239,18 +239,23 @@ impl App {
     }
 
     fn add_log(&mut self, text: impl AsRef<str>) {
-        self.log.push_back(format!(
-            "{}  {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            text.as_ref()
-        ));
+        let text = text.as_ref();
+        logging::line(text);
+        self.log
+            .push_back(format!("{}  {text}", chrono::Local::now().format("%H:%M:%S")));
         while self.log.len() > 300 {
             self.log.pop_front();
         }
     }
 
     pub fn show_error(&mut self, message: impl Into<String>) {
-        self.modal = Some(Modal::Error(message.into()));
+        let message = message.into();
+        // the dialog is enough for whoever is watching, but the log should say it too, unless
+        // the panel has just written the same thing out
+        if !self.log.back().is_some_and(|last| last.ends_with(&message)) {
+            logging::line(&format!("error: {message}"));
+        }
+        self.modal = Some(Modal::Error(message));
     }
 
     fn confirm(&mut self, title: &str, message: &str, then: Then) {
