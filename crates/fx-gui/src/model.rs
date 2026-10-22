@@ -146,14 +146,29 @@ impl PartRow {
     }
 }
 
+/// What the scan made of a drive, in the words the whole window uses: the drive list, the heading
+/// over the partitions and the line under the toolbar all say the same thing, so a drive that was
+/// filled in on one console is named the same way wherever it appears.
+pub fn drive_kind_label(kind: DriveKind) -> &'static str {
+    match kind {
+        DriveKind::Unknown => "no console partitions found",
+        DriveKind::SinglePartition => "a single FATX partition",
+        DriveKind::OgDrive => "original Xbox drive",
+        DriveKind::Xbox360Drive => "Xbox 360 drive",
+    }
+}
+
 pub fn drive_summary(title: &str, scan: &DriveScan, usable: usize) -> String {
+    let partitions = if usable == 1 { "" } else { "s" };
+    let label = drive_kind_label(scan.kind);
     match scan.kind {
-        DriveKind::Unknown => format!("{title}: no Xbox 360 partitions found. It may be blank, you can format it."),
-        DriveKind::SinglePartition => format!("{title}: a single FATX partition."),
-        DriveKind::Xbox360Drive => format!(
-            "{title}: Xbox 360 drive, {usable} partition{} you can open.",
-            if usable == 1 { "" } else { "s" }
-        ),
+        DriveKind::Unknown => {
+            format!("{title}: {label}. It may be blank, you can format it.")
+        }
+        DriveKind::SinglePartition => format!("{title}: {label}."),
+        DriveKind::OgDrive | DriveKind::Xbox360Drive => {
+            format!("{title}: {label}, {usable} partition{partitions} you can open.")
+        }
     }
 }
 
@@ -803,6 +818,30 @@ mod tests {
         );
         assert!(SourceRow::from_disk(&disk("2", 1 << 30, false, true)).note.is_some());
         assert!(SourceRow::from_disk(&disk("4", 1 << 30, false, false)).note.is_none());
+    }
+
+    #[test]
+    fn every_kind_of_drive_has_a_name_to_show() {
+        // the drive list, the heading over the partitions and the status line all use these, so
+        // a drive reads the same wherever it turns up
+        assert_eq!(drive_kind_label(DriveKind::OgDrive), "original Xbox drive");
+        assert_eq!(drive_kind_label(DriveKind::Xbox360Drive), "Xbox 360 drive");
+        assert_eq!(
+            drive_kind_label(DriveKind::SinglePartition),
+            "a single FATX partition"
+        );
+        assert_eq!(
+            drive_kind_label(DriveKind::Unknown),
+            "no console partitions found"
+        );
+    }
+
+    #[test]
+    fn the_summary_line_names_the_console() {
+        let scan = console_scan(6 << 30);
+        let summary = drive_summary("Disk 3", &scan, 4);
+        assert!(summary.contains("Xbox 360 drive"), "{summary}");
+        assert!(summary.contains("4 partitions"), "{summary}");
     }
 
     #[test]

@@ -121,8 +121,10 @@ freeXplorer-rs command line tool
 usage: freexplorer-rs <command> [options]
 
 Targets are a physical disk (disk:3 on Windows, disk:sdb or disk:disk2 elsewhere) or a raw
-image file. Physical disks need an administrator prompt (or sudo). Partitions are content,
-compat, sysext and sysext2.
+image file. Physical disks need an administrator prompt (or sudo).
+
+Partitions are content, compat, sysext and sysext2 on an Xbox 360, and x, y, z, c, e, f, g
+on an original Xbox. Either way the drive is detected, there's no need to say which it is.
 
 looking around
   list [--scan]                         show the disks connected to this computer

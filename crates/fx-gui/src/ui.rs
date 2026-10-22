@@ -4,7 +4,7 @@ use eframe::egui::{self, Align, Button, Color32, CornerRadius, Frame, Layout, Ma
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::{App, DriverState};
-use crate::model::SourceKind;
+use crate::model::{drive_kind_label, SourceKind};
 use crate::theme::{self, Palette};
 
 pub use crate::dialogs::modals;
@@ -174,12 +174,29 @@ fn driver_button(app: &mut App, ui: &mut egui::Ui) {
     }
 }
 
+/// One line in the list of drives, copied out of the app so the list can be drawn while the rest
+/// of the window holds on to it.
+struct DriveRow {
+    key: String,
+    title: String,
+    /// what the scan made of the drive, once it has been read
+    kind: Option<&'static str>,
+    subtitle: String,
+    note: Option<String>,
+}
+
 fn drives(app: &mut App, ui: &mut egui::Ui) {
     let p = app.palette;
-    let rows: Vec<(String, String, String, Option<String>)> = app
+    let rows: Vec<DriveRow> = app
         .sources
         .iter()
-        .map(|s| (s.key.clone(), s.title.clone(), s.subtitle.clone(), s.note.clone()))
+        .map(|s| DriveRow {
+            key: s.key.clone(),
+            title: s.title.clone(),
+            kind: s.loaded.as_ref().map(|l| drive_kind_label(l.scan.kind)),
+            subtitle: s.subtitle.clone(),
+            note: s.note.clone(),
+        })
         .collect();
     let selected = app.selected.clone();
     let enabled = !app.busy();
@@ -189,7 +206,8 @@ fn drives(app: &mut App, ui: &mut egui::Ui) {
         ui.label(RichText::new("Drives").strong().size(15.0));
         ui.add_space(6.0);
         egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-            for (key, title, subtitle, note) in rows {
+            for row in rows {
+                let DriveRow { key, title, kind, subtitle, note } = row;
                 let is_selected = selected.as_deref() == Some(key.as_str());
                 let id = ui.make_persistent_id(&key);
                 let fill = if is_selected { p.selected } else { Color32::TRANSPARENT };
@@ -200,6 +218,9 @@ fn drives(app: &mut App, ui: &mut egui::Ui) {
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(RichText::new(&title).strong());
+                        if let Some(kind) = kind {
+                            ui.label(RichText::new(kind).color(p.accent).size(12.0));
+                        }
                         ui.label(RichText::new(&subtitle).color(p.muted).size(12.0));
                         if let Some(note) = &note {
                             ui.label(RichText::new(note).color(p.note).size(12.0));
@@ -227,6 +248,10 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
         .selected_source()
         .map(|s| s.title.clone())
         .unwrap_or_else(|| "Partitions".into());
+    let kind = app
+        .selected_source()
+        .and_then(|s| s.loaded.as_ref())
+        .map(|l| drive_kind_label(l.scan.kind));
     let selected = app.selected_part.clone();
     let rows: Vec<_> = app
         .partitions()
@@ -246,7 +271,12 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
 
     card(&p).show(ui, |ui| {
         ui.set_min_size(ui.available_size());
-        ui.label(RichText::new(title).strong().size(15.0));
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(title).strong().size(15.0));
+            if let Some(kind) = kind {
+                ui.label(RichText::new(kind).color(p.accent).size(13.0));
+            }
+        });
         ui.add_space(6.0);
 
         let mut clicked = None;
