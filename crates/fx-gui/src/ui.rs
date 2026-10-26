@@ -107,7 +107,10 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
 
     ui.add_space(4.0);
     ui.horizontal(|ui| {
-        if ui.add_enabled(can_mount, accent_button("Mount", &p)).clicked() {
+        // the button says which mount you're about to get, because the mode is otherwise only
+        // mentioned afterwards, in the log, by which time it is too late to change it
+        let mount_label = if app.allow_writing { "Mount with writing" } else { "Mount read-only" };
+        if ui.add_enabled(can_mount, accent_button(mount_label, &p)).clicked() {
             app.mount_selected();
         }
         if ui.add_enabled(can_unmount, Button::new("Unmount")).clicked() {

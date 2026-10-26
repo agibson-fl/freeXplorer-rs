@@ -457,6 +457,16 @@ impl App {
                     self.status,
                     if read_only { "read-only" } else { "read/write" }
                 ));
+                if read_only {
+                    // say why, so a read-only mount is never a mystery: the only two ways to get
+                    // one here are the box not being ticked, or a device that wouldn't open for
+                    // writing, and the log should tell the two apart
+                    self.add_log(if self.allow_writing {
+                        "The mount is read-only even though writing was turned on: the drive or image wouldn't open for writing."
+                    } else {
+                        "Read-only. Tick \"Allow writing when mounting\", then mount again to change files."
+                    });
+                }
                 fx_platform::open_in_shell(&shell_path(&point));
             }
             Err(err) => {
@@ -550,6 +560,13 @@ impl App {
     }
 
     fn start_mount(&mut self, source: SourceRow, part: PartRow, write: bool) {
+        // record what was asked for: if the result ever comes back read-only, the log then shows
+        // whether this program chose it or the drive did
+        self.add_log(format!(
+            "Mounting {} {}.",
+            part.name(),
+            if write { "read/write" } else { "read-only" }
+        ));
         let detected = part.detected.clone();
         self.run(false, None, move |r| jobs::mount_one(r, source, detected, write));
     }
