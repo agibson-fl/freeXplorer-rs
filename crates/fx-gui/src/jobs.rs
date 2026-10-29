@@ -12,7 +12,7 @@ use fx_core::Error;
 use fx_core::backup::{self, BackupOptions, RestoreOptions};
 use fx_core::copy::{Cancel, Progress};
 use fx_core::device::{Device, FileDevice};
-use fx_core::fatx::{self, FormatOptions};
+use fx_core::fatx::{self, FormatOptions, Severity};
 use fx_core::size;
 use fx_core::xbox360::formatter::{self, HddFormatOptions};
 use fx_core::xbox360::scanner::{self, DetectedPartition};
@@ -66,6 +66,9 @@ pub enum Msg {
     },
     /// the job is over, successfully or not
     Done,
+    /// a block of text for the log file only. The panel keeps the one-line verdict; the file keeps
+    /// the whole report, which is what a bug report needs and what a closed dialog no longer has.
+    LogDetail(String),
     /// a background pass of the kind that never takes the job slot has finished, so the drive is
     /// free to be opened again
     SideDone,
@@ -342,10 +345,104 @@ pub fn check(r: &Reporter, source: SourceRow, part: DetectedPartition) {
 /// What a check found, in the shape the partition list keeps. Both the background pass and the
 /// Check button go through this, so a row says the same thing whichever of them filled it in.
 fn state_of(report: &fx_core::fatx::FsckReport) -> CheckState {
+    let blocked = report.incomplete;
     CheckState {
         errors: report.errors(),
         warnings: report.warnings(),
         reclaimable_bytes: report.orphan_clusters * report.bytes_per_cluster,
+        blocked,
+        reason: if blocked {
+            report
+                .issues
+                .iter()
+                .find(|i| i.severity == Severity::Error)
+                .map(|i| i.message.clone())
+                .unwrap_or_else(|| "the volume couldn't be read completely".to_string())
+        } else {
+            String::new()
+        },
+    }
+}
+
+/// Releases clusters the FAT calls used that no file owns. The volume refuses by itself when it
+/// couldn't be read completely, so a click here can't cut a file in half.
+pub fn fix(r: &Reporter, source: SourceRow, part: DetectedPartition) {
+    r.progress(0.0, Some(format!("Fixing {}...", part.name())));
+    let result = (|| -> Result<(String, String), String> {
+        let device = open(&source, true)?;
+        let mut volume = scanner::open_partition(&device, &part, true).map_err(describe)?;
+        let report = volume.check(true, |_| {}).map_err(describe)?;
+        volume.flush().map_err(describe)?;
+        // read it back rather than trusting the fix: this is the figure the console will see
+        let after = volume.check(false, |_| {}).map_err(describe)?;
+
+        // one line saying what actually happened. "Fixed F." over a fix that released nothing is
+        // exactly how a no-op came to look like a repair.
+        let verdict = if report.fixed_clusters > 0 {
+            format!(
+                "Fixed {}: released {}, {} clusters.",
+                part.name(),
+                size::format(report.released_bytes()),
+                report.fixed_clusters
+            )
+        } else if !report.fixable() {
+            format!(
+                "{} wasn't fixed: the volume couldn't be read completely, so nothing was released.",
+                part.name()
+            )
+        } else if report.orphan_clusters > 0 {
+            format!("{} wasn't fixed: nothing was released.", part.name())
+        } else {
+            format!(
+                "{} needed no fix: nothing was marked used without a file owning it.",
+                part.name()
+            )
+        };
+
+        let mut text = report.to_text(part.name());
+        if report.fixed_clusters > 0 {
+            text += &format!(
+                "\nReleased {} clusters, {} of space.\n",
+                report.fixed_clusters,
+                size::format(report.released_bytes())
+            );
+        } else if !report.fixable() {
+            text += "\nNothing was released. This volume needs a reformat, not a fix.\n";
+        } else if report.orphan_clusters > 0 {
+            text += "\nNothing was released.\n";
+        }
+        text += &format!(
+            "In use now: {}, free: {} of {}.\n",
+            size::format(after.used_bytes()),
+            size::format(after.free_bytes()),
+            size::format(after.used_bytes() + after.free_bytes())
+        );
+        let verdict_after = if after.is_clean() {
+            "Checked again afterwards: no problems found.\n".to_string()
+        } else {
+            format!(
+                "Checked again afterwards: {} errors and {} warnings remain.\n",
+                after.errors(),
+                after.warnings()
+            )
+        };
+        text += &verdict_after;
+        Ok((text, verdict))
+    })();
+    match result {
+        Ok((text, verdict)) => {
+            // the panel gets the one-line answer; the log file gets the whole report as well, which
+            // is what a bug report needs and what the dialog is too easy to close without
+            r.log(&verdict);
+            r.send(Msg::LogDetail(text.clone()));
+            r.send(Msg::Status(verdict));
+            r.send(Msg::Text {
+                title: format!("Fix of {}", part.name()),
+                text,
+            });
+            r.send(Msg::Reload(source.key.clone()));
+        }
+        Err(err) => r.send(Msg::Error(err)),
     }
 }
 
@@ -594,8 +691,10 @@ impl ReportText for fx_core::fatx::FsckReport {
             text += "\n";
             text += if self.errors() > 0 {
                 "There is real damage. Copy your files somewhere safe before changing anything.\n"
+            } else if self.fixed_clusters > 0 {
+                "There was no damage: the leftover space has been released.\n"
             } else {
-                "Nothing is lost, there is just some unused space that the command line tool can release (fsck --fix).\n"
+                "There is no damage. The leftover space is marked used by nothing, and Fix releases it.\n"
             };
         }
         text

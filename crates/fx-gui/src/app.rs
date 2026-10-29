@@ -39,6 +39,7 @@ enum Pending {
     /// The background pass over a drive that was just read.
     Check(String),
     CheckPart(SourceRow, DetectedPartition),
+    Fix(SourceRow, DetectedPartition),
     Mount(SourceRow, DetectedPartition, bool),
     Format(SourceRow, FormatRequest),
     Backup(SourceRow, DiskInfo, BackupRequest),
@@ -268,6 +269,7 @@ impl App {
                 Pending::Load(key) => self.load_now(&key),
                 Pending::Check(key) => self.start_checks(&key),
                 Pending::CheckPart(source, part) => self.check_now(source, part),
+                Pending::Fix(source, part) => self.fix_now(source, part),
                 Pending::Mount(source, part, write) => self.mount_now(source, part, write),
                 Pending::Format(source, request) => {
                     self.run(false, None, move |r| jobs::format(r, source, request));
@@ -355,6 +357,7 @@ impl App {
                 }
             }
             Msg::Log(text) => self.add_log(text),
+            Msg::LogDetail(text) => logging::line(&text),
             Msg::Status(text) => self.status = text,
             Msg::Disks(disks) => self.update_disks(disks),
             Msg::Polled(disks) => {
@@ -606,16 +609,23 @@ impl App {
             let name = row.name().to_string();
             match result {
                 Ok(state) => {
+                    let blocked = state.blocked;
                     let errors = state.errors;
                     let reclaimable = state.reclaimable_bytes;
                     row.check = Some(state);
-                    if errors > 0 {
+                    if blocked {
+                        // the walk never reached the whole tree, so there is nothing a fix could
+                        // release: this is the one verdict that has to be said out loud
+                        note = Some(format!(
+                            "{name}: needs a reformat. The check couldn't read the whole volume, so no amount of fixing will recover it."
+                        ));
+                    } else if errors > 0 {
                         note = Some(format!(
                             "{name}: damaged, {errors} errors. Check names them."
                         ));
                     } else if reclaimable > 0 {
                         note = Some(format!(
-                            "{name}: {} belongs to no file.",
+                            "{name}: {} belongs to no file. Fix releases it.",
                             fx_core::size::format(reclaimable)
                         ));
                     }
@@ -824,6 +834,40 @@ impl App {
             row.checking = true;
         }
         self.run(false, None, move |r| jobs::check(r, source, part));
+    }
+
+    /// Releases space every file already says is free. A mounted partition is refused: its own
+    /// copy of the directory tree is live, and writing the allocation table underneath it would
+    /// corrupt the mount.
+    pub fn fix_selected(&mut self) {
+        let (Some(source), Some(part)) = (self.selected_source().cloned(), self.selected_partition().cloned()) else {
+            return;
+        };
+        if part.is_mounted() {
+            self.show_error("Unmount this partition before fixing it.");
+            return;
+        }
+        // the button is disabled for this, but the refusal belongs in one place too: releasing
+        // space on a volume the check couldn't read is how a real file loses its clusters
+        if part.check.as_ref().is_some_and(|c| c.blocked) {
+            self.show_error(
+                "The check couldn't read this volume completely, so releasing space could cut real files in half. This one needs a reformat.",
+            );
+            return;
+        }
+        if let Some(disk) = &source.disk
+            && let Err(why) = safety::check_write(disk, false)
+        {
+            self.show_error(why);
+            return;
+        }
+        // queued: a fix writes the allocation table, and the background check must not be reading
+        // it when that lands
+        self.request(Pending::Fix(source, part.detected));
+    }
+
+    fn fix_now(&mut self, source: SourceRow, part: DetectedPartition) {
+        self.run(false, None, move |r| jobs::fix(r, source, part));
     }
 
     pub fn format_selected(&mut self) {

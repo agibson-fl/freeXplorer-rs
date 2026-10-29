@@ -109,6 +109,11 @@ pub struct CheckState {
     pub warnings: usize,
     /// Space the FAT calls used that no file owns: the part a fix can release.
     pub reclaimable_bytes: u64,
+    /// The check couldn't read the whole volume, so releasing space could cut real files in half.
+    /// Set from the report, so the window refuses the same way the core does.
+    pub blocked: bool,
+    /// What stopped it, in the report's own words: the first error it found.
+    pub reason: String,
 }
 
 /// How a row should read: nothing to say, something to reclaim, or real damage.
@@ -178,7 +183,11 @@ impl PartRow {
         // a check is the only thing that can tell a full partition from one carrying space that
         // belongs to no file, so say what it found rather than "Ready to mount"
         if let Some(c) = &self.check {
-            return if c.errors > 0 {
+            return if c.blocked {
+                // the walk couldn't reach the whole tree, so there is nothing a fix could stand on:
+                // this is the answer to "fix it or reformat it", and it belongs in the row
+                "Needs a reformat".into()
+            } else if c.errors > 0 {
                 format!("Damaged: {} error{}", c.errors, if c.errors == 1 { "" } else { "s" })
             } else if c.reclaimable_bytes > 0 {
                 format!("{} reclaimable", size::format(c.reclaimable_bytes))
@@ -195,6 +204,14 @@ impl PartRow {
     /// The colour the status should be drawn in, when there is something to say.
     pub fn tone(&self) -> Option<Tone> {
         self.check.as_ref().map(|c| c.tone())
+    }
+
+    /// Why the check gave up, when it did: shown on hover, so the row can stay one short phrase.
+    pub fn detail(&self) -> Option<&str> {
+        self.check
+            .as_ref()
+            .filter(|c| c.blocked)
+            .map(|c| c.reason.as_str())
     }
 }
 
@@ -896,10 +913,10 @@ mod tests {
         assert!(summary.contains("4 partitions"), "{summary}");
     }
 
-    /// The row is where a check's verdict has to be legible, because that is the only place a
-    /// person looks before pressing a button.
+    /// The row is where the answer to "fix it or reformat it" has to be legible, because that is
+    /// the only place a person looks before pressing a button.
     #[test]
-    fn a_checked_row_says_what_the_check_found() {
+    fn a_volume_the_check_could_not_read_says_it_needs_a_reformat() {
         let scan = console_scan(6 << 30);
         let mut row = PartRow {
             detected: scan.partitions.iter().find(|p| p.id() == "content").unwrap().clone(),
@@ -910,23 +927,30 @@ mod tests {
         };
         assert_eq!(row.status(), "Ready to mount");
         assert_eq!(row.tone(), None);
+        assert_eq!(row.detail(), None);
 
         row.check = Some(CheckState {
             errors: 20,
             warnings: 3,
             reclaimable_bytes: 98 << 30,
+            blocked: true,
+            reason: "the root cluster doesn't look like a directory".into(),
         });
-        assert_eq!(row.status(), "Damaged: 20 errors");
+        assert_eq!(row.status(), "Needs a reformat");
         assert_eq!(row.tone(), Some(Tone::Bad));
+        assert_eq!(row.detail(), Some("the root cluster doesn't look like a directory"));
 
         // space that belongs to no file is worth reclaiming, and is not the same verdict
         row.check = Some(CheckState {
             errors: 0,
             warnings: 1,
             reclaimable_bytes: 75 << 30,
+            blocked: false,
+            reason: String::new(),
         });
         assert_eq!(row.status(), "75 GB reclaimable");
         assert_eq!(row.tone(), Some(Tone::Warn));
+        assert_eq!(row.detail(), None);
     }
 
     #[test]

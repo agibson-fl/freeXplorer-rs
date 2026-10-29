@@ -74,10 +74,14 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     // extract booleans we need for button enablement to avoid borrow issues in closures
     let part_can_mount = part.as_ref().is_some_and(|p| p.can_mount());
     let part_is_mounted = part.as_ref().is_some_and(|p| p.is_mounted());
+    let part_blocked = part.as_ref().is_some_and(|p| p.check.as_ref().is_some_and(|c| c.blocked));
     let can_mount = !busy && part_can_mount && !part_is_mounted;
     let can_unmount = !busy && part_is_mounted;
     let can_open = part_is_mounted;
     let can_check = !busy && part_can_mount;
+    // same rule as Check, minus the mounted case: the FAT mustn't change under a live mount
+    // also disabled when the check found the volume couldn't be read completely (blocked)
+    let can_fix = !busy && part_can_mount && !part_is_mounted && !part_blocked;
     let can_format = !busy
         && app
             .selected_source()
@@ -132,9 +136,24 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             // right to left, so the first added sits furthest right: the order below reads
-            // Check, Format across the bar
+            // Check, Fix, Format across the bar
             if ui.add_enabled(can_format, Button::new("Format...")).clicked() {
                 app.format_selected();
+            }
+            // Fix is the only button here that writes without a dialog, so it is also the only one
+            // the core has to defend: the volume refuses to release anything it couldn't read fully
+            let fix_button = Button::new("Fix");
+            let fix_response = if part_blocked {
+                ui.add_enabled(can_fix, fix_button).on_hover_text(
+                    "Fix unavailable: the check couldn't read this volume completely.\n\
+                     Releasing space could cut real files in half.\n\
+                     Copy your files off; this one needs a reformat."
+                )
+            } else {
+                ui.add_enabled(can_fix, fix_button)
+            };
+            if fix_response.clicked() {
+                app.fix_selected();
             }
             if ui.add_enabled(can_check, Button::new("Check")).clicked() {
                 app.check_selected();
@@ -274,6 +293,7 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                 r.status(),
                 r.is_mounted(),
                 r.tone(),
+                r.detail().map(str::to_string),
             )
         })
         .collect();
@@ -310,7 +330,7 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                 })
                 .body(|body| {
                     body.rows(32.0, rows.len(), |mut row| {
-                        let (id, name, size, format, offset, status, mounted, tone) = &rows[row.index()];
+                        let (id, name, size, format, offset, status, mounted, tone, detail) = &rows[row.index()];
                         let is_selected = selected.as_deref() == Some(id.as_str());
                         let fill = match (*mounted, is_selected) {
                             (true, true) => Some(p.mounted_selected_row),
@@ -335,7 +355,15 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                                         (4, Some(Tone::Good)) => RichText::new(text.as_str()).color(p.good),
                                         _ => RichText::new(text.as_str()),
                                     };
-                                    ui.add(egui::Label::new(text).truncate());
+                                    let label = ui.add(egui::Label::new(text).truncate());
+                                    // the row stays one short phrase; the reason the check gave up
+                                    // is the answer to "fix it or reformat it", so it must be
+                                    // reachable without opening the report
+                                    if cell == 4
+                                        && let Some(detail) = detail
+                                    {
+                                        let _ = label.on_hover_text(detail);
+                                    }
                                 });
                             });
                         }
