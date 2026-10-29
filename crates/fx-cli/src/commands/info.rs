@@ -166,14 +166,20 @@ pub fn fsck(args: &[String], ctx: &mut Context) -> Outcome {
     }
     say!(
         ctx,
-        "{} folders, {} files, {} of data, {} clusters in use",
+        "{} folders, {} files, {} of data, {} clusters in use, {} free",
         report.directories,
         report.files,
         size::format(report.file_bytes),
-        report.used_clusters
+        report.used_clusters,
+        size::format(report.free_bytes())
     );
     if report.fixed_clusters > 0 {
-        say!(ctx, "released {} leaked clusters", report.fixed_clusters);
+        say!(
+            ctx,
+            "released {} leaked clusters ({})",
+            report.fixed_clusters,
+            size::format(report.released_bytes())
+        );
     }
 
     if report.errors() > 0 {
