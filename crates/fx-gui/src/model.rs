@@ -96,6 +96,39 @@ pub struct PartRow {
     pub detected: DetectedPartition,
     pub format: String,
     pub mount: Option<MountState>,
+    /// What a read-only check found, when one has been run. `None` means nobody has looked.
+    pub check: Option<CheckState>,
+    /// A check is running on a background thread right now.
+    pub checking: bool,
+}
+
+/// The result of a read-only check, kept so the partition list can say it without a dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckState {
+    pub errors: usize,
+    pub warnings: usize,
+    /// Space the FAT calls used that no file owns: the part a fix can release.
+    pub reclaimable_bytes: u64,
+}
+
+/// How a row should read: nothing to say, something to reclaim, or real damage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    Good,
+    Warn,
+    Bad,
+}
+
+impl CheckState {
+    pub fn tone(&self) -> Tone {
+        if self.errors > 0 {
+            Tone::Bad
+        } else if self.reclaimable_bytes > 0 {
+            Tone::Warn
+        } else {
+            Tone::Good
+        }
+    }
 }
 
 impl PartRow {
@@ -142,7 +175,26 @@ impl PartRow {
         if !self.detected.has_signature {
             return "Not formatted".into();
         }
+        // a check is the only thing that can tell a full partition from one carrying space that
+        // belongs to no file, so say what it found rather than "Ready to mount"
+        if let Some(c) = &self.check {
+            return if c.errors > 0 {
+                format!("Damaged: {} error{}", c.errors, if c.errors == 1 { "" } else { "s" })
+            } else if c.reclaimable_bytes > 0 {
+                format!("{} reclaimable", size::format(c.reclaimable_bytes))
+            } else {
+                "Checked, no problems".into()
+            };
+        }
+        if self.checking {
+            return "Checking...".into();
+        }
         "Ready to mount".into()
+    }
+
+    /// The colour the status should be drawn in, when there is something to say.
+    pub fn tone(&self) -> Option<Tone> {
+        self.check.as_ref().map(|c| c.tone())
     }
 }
 
@@ -844,6 +896,39 @@ mod tests {
         assert!(summary.contains("4 partitions"), "{summary}");
     }
 
+    /// The row is where a check's verdict has to be legible, because that is the only place a
+    /// person looks before pressing a button.
+    #[test]
+    fn a_checked_row_says_what_the_check_found() {
+        let scan = console_scan(6 << 30);
+        let mut row = PartRow {
+            detected: scan.partitions.iter().find(|p| p.id() == "content").unwrap().clone(),
+            format: String::new(),
+            mount: None,
+            check: None,
+            checking: false,
+        };
+        assert_eq!(row.status(), "Ready to mount");
+        assert_eq!(row.tone(), None);
+
+        row.check = Some(CheckState {
+            errors: 20,
+            warnings: 3,
+            reclaimable_bytes: 98 << 30,
+        });
+        assert_eq!(row.status(), "Damaged: 20 errors");
+        assert_eq!(row.tone(), Some(Tone::Bad));
+
+        // space that belongs to no file is worth reclaiming, and is not the same verdict
+        row.check = Some(CheckState {
+            errors: 0,
+            warnings: 1,
+            reclaimable_bytes: 75 << 30,
+        });
+        assert_eq!(row.status(), "75 GB reclaimable");
+        assert_eq!(row.tone(), Some(Tone::Warn));
+    }
+
     #[test]
     fn partition_status_follows_what_is_there() {
         let scan = console_scan(6 << 30);
@@ -851,6 +936,8 @@ mod tests {
             detected: scan.partitions.iter().find(|p| p.id() == id).unwrap().clone(),
             format: String::new(),
             mount: None,
+            check: None,
+            checking: false,
         };
         assert_eq!(row("syscache").status(), "Cache, not browsable");
         assert_eq!(row("content").status(), "Ready to mount");

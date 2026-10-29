@@ -20,8 +20,8 @@ use fx_core::xbox360::security::{self, SecuritySector};
 use fx_platform::{DiskInfo, KeepAwake, safety};
 
 use crate::model::{
-    BackupRequest, FormatRequest, Loaded, MountState, PartRow, RestoreInfo, RestoreRequest, SourceKind, SourceRow,
-    drive_summary,
+    BackupRequest, CheckState, FormatRequest, Loaded, MountState, PartRow, RestoreInfo, RestoreRequest, SourceKind,
+    SourceRow, drive_summary,
 };
 
 /// What a worker tells the window.
@@ -37,6 +37,12 @@ pub enum Msg {
     Loaded {
         key: String,
         result: Result<Loaded, String>,
+    },
+    /// one partition's read-only check finished, from the background pass or the Check button
+    Checked {
+        key: String,
+        part_id: String,
+        result: Result<CheckState, String>,
     },
     Mounted {
         key: String,
@@ -60,6 +66,9 @@ pub enum Msg {
     },
     /// the job is over, successfully or not
     Done,
+    /// a background pass of the kind that never takes the job slot has finished, so the drive is
+    /// free to be opened again
+    SideDone,
 }
 
 /// What a worker uses to talk back.
@@ -108,6 +117,26 @@ pub fn spawn(reporter: &Reporter, work: impl FnOnce(&Reporter) + Send + 'static)
             reporter.send(Msg::Error(format!("freeXplorer-rs hit a bug: {what}")));
         }
         reporter.send(Msg::Done);
+    });
+}
+
+/// Runs a pass that must not take the window's job slot, so the drive stays usable while it works.
+///
+/// It reports `SideDone` rather than `Done`: that is what tells the window the drive has been let
+/// go of, and mounting and checking both want the device to themselves, so anything queued behind
+/// this pass waits for it — including when the pass panics.
+pub fn spawn_side(reporter: &Reporter, work: impl FnOnce(&Reporter) + Send + 'static) {
+    let reporter = reporter.clone();
+    std::thread::spawn(move || {
+        if let Err(panic) = catch_unwind(AssertUnwindSafe(|| work(&reporter))) {
+            let what = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "something unexpected".into());
+            reporter.send(Msg::Error(format!("freeXplorer-rs hit a bug: {what}")));
+        }
+        reporter.send(Msg::SideDone);
     });
 }
 
@@ -165,22 +194,63 @@ pub fn read_source(r: &Reporter, source: SourceRow) {
     });
 }
 
+/// Checks every partition in turn on a thread of its own, reporting each one as it finishes.
+///
+/// This is deliberately not a `run` job: the drive stays usable while it works, the list fills in
+/// as answers arrive, and a slow partition no longer holds up the window. It is one thread and one
+/// device handle rather than one per partition — the checks are reads from the same disk, so they
+/// would queue on the drive anyway, and the notes in AGENTS.md are clear about what two readers on
+/// one marginal drive cost.
+pub fn check_partitions(r: &Reporter, source: SourceRow, parts: Vec<DetectedPartition>) {
+    let device = match open(&source, false) {
+        Ok(device) => device,
+        Err(err) => {
+            for part in parts {
+                r.send(Msg::Checked {
+                    key: source.key.clone(),
+                    part_id: part.id().to_string(),
+                    result: Err(err.clone()),
+                });
+            }
+            return;
+        }
+    };
+    for part in parts {
+        if r.cancel.is_cancelled() {
+            return;
+        }
+        let result = scanner::open_partition(&device, &part, false)
+            .and_then(|mut volume| volume.check_with(false, &r.cancel, |_| {}))
+            .map(|report| state_of(&report))
+            .map_err(describe);
+        if r.cancel.is_cancelled() {
+            // the user wants the drive; a half-finished walk has nothing worth reporting
+            return;
+        }
+        r.send(Msg::Checked {
+            key: source.key.clone(),
+            part_id: part.id().to_string(),
+            result,
+        });
+    }
+}
+
 fn describe_partition(device: &Device, p: &DetectedPartition) -> PartRow {
     let mut format = String::new();
     if p.can_mount() {
-        match scanner::open_partition(device, p, false).map(|v| {
-            let kind = if v.flavor() == fatx::Flavor::Xbox360 {
-                "XTAF"
-            } else {
-                "FATX"
-            };
-            format!(
-                "{kind}, {} KB clusters, FAT{}",
-                v.cluster_size() / 1024,
-                v.geometry().fat_entry_size * 8
-            )
-        }) {
-            Ok(text) => format = text,
+        match scanner::open_partition(device, p, false) {
+            Ok(volume) => {
+                let kind = if volume.flavor() == fatx::Flavor::Xbox360 {
+                    "XTAF"
+                } else {
+                    "FATX"
+                };
+                format = format!(
+                    "{kind}, {} KB clusters, FAT{}",
+                    volume.cluster_size() / 1024,
+                    volume.geometry().fat_entry_size * 8
+                );
+            }
             Err(err) => format = format!("Looks damaged: {err}"),
         }
     }
@@ -188,6 +258,8 @@ fn describe_partition(device: &Device, p: &DetectedPartition) -> PartRow {
         detected: p.clone(),
         format,
         mount: None,
+        check: None,
+        checking: false,
     }
 }
 
@@ -235,14 +307,20 @@ pub fn unmount(r: &Reporter, entries: Vec<(String, String, fx_mount::Mounted)>) 
 pub fn check(r: &Reporter, source: SourceRow, part: DetectedPartition) {
     r.progress(0.0, Some(format!("Checking {}...", part.name())));
     // a mounted volume is being modified through its own copy of the directory tree, so check it read-only
-    let result = (|| -> Result<String, String> {
+    let result = (|| -> Result<(String, CheckState), String> {
         let device = open(&source, false)?;
         let mut volume = scanner::open_partition(&device, &part, false).map_err(describe)?;
-        let report = volume.check(false, |_| {}).map_err(describe)?;
-        Ok(report.to_text(part.name()))
+        let report = volume.check_with(false, &r.cancel, |_| {}).map_err(describe)?;
+        Ok((report.to_text(part.name()), state_of(&report)))
     })();
     match result {
-        Ok(text) => {
+        Ok((text, state)) => {
+            // the button's answer belongs on the row as well as in the dialog, so the list keeps it
+            r.send(Msg::Checked {
+                key: source.key.clone(),
+                part_id: part.id().to_string(),
+                result: Ok(state),
+            });
             r.send(Msg::Text {
                 title: format!("Check of {}", part.name()),
                 text,
@@ -250,7 +328,24 @@ pub fn check(r: &Reporter, source: SourceRow, part: DetectedPartition) {
             r.send(Msg::Status(format!("Checked {}.", part.name())));
             r.log(format!("Checked {}.", part.name()));
         }
-        Err(err) => r.send(Msg::Error(err)),
+        Err(err) => {
+            r.send(Msg::Checked {
+                key: source.key.clone(),
+                part_id: part.id().to_string(),
+                result: Err(err.clone()),
+            });
+            r.send(Msg::Error(err));
+        }
+    }
+}
+
+/// What a check found, in the shape the partition list keeps. Both the background pass and the
+/// Check button go through this, so a row says the same thing whichever of them filled it in.
+fn state_of(report: &fx_core::fatx::FsckReport) -> CheckState {
+    CheckState {
+        errors: report.errors(),
+        warnings: report.warnings(),
+        reclaimable_bytes: report.orphan_clusters * report.bytes_per_cluster,
     }
 }
 

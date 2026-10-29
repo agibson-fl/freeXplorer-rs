@@ -4,7 +4,7 @@ use eframe::egui::{self, Align, Button, Color32, CornerRadius, Frame, Layout, Ma
 use egui_extras::{Column, TableBuilder};
 
 use crate::app::{App, DriverState};
-use crate::model::{drive_kind_label, SourceKind};
+use crate::model::{drive_kind_label, SourceKind, Tone};
 use crate::theme::{self, Palette};
 
 pub use crate::dialogs::modals;
@@ -71,10 +71,13 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
     let busy = app.busy();
     let can_backup = !busy && app.selected_source().is_some_and(|s| s.kind == SourceKind::Disk);
     let part = app.selected_partition();
-    let can_mount = !busy && part.is_some_and(|p| p.can_mount() && !p.is_mounted());
-    let can_unmount = !busy && part.is_some_and(|p| p.is_mounted());
-    let can_open = part.is_some_and(|p| p.is_mounted());
-    let can_check = !busy && part.is_some_and(|p| p.can_mount());
+    // extract booleans we need for button enablement to avoid borrow issues in closures
+    let part_can_mount = part.as_ref().is_some_and(|p| p.can_mount());
+    let part_is_mounted = part.as_ref().is_some_and(|p| p.is_mounted());
+    let can_mount = !busy && part_can_mount && !part_is_mounted;
+    let can_unmount = !busy && part_is_mounted;
+    let can_open = part_is_mounted;
+    let can_check = !busy && part_can_mount;
     let can_format = !busy
         && app
             .selected_source()
@@ -128,6 +131,8 @@ fn toolbar(app: &mut App, ui: &mut egui::Ui) {
         ui.checkbox(&mut app.allow_writing, "Allow writing when mounting");
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            // right to left, so the first added sits furthest right: the order below reads
+            // Check, Format across the bar
             if ui.add_enabled(can_format, Button::new("Format...")).clicked() {
                 app.format_selected();
             }
@@ -268,6 +273,7 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                 r.offset_text(),
                 r.status(),
                 r.is_mounted(),
+                r.tone(),
             )
         })
         .collect();
@@ -304,7 +310,7 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                 })
                 .body(|body| {
                     body.rows(32.0, rows.len(), |mut row| {
-                        let (id, name, size, format, offset, status, mounted) = &rows[row.index()];
+                        let (id, name, size, format, offset, status, mounted, tone) = &rows[row.index()];
                         let is_selected = selected.as_deref() == Some(id.as_str());
                         let fill = match (*mounted, is_selected) {
                             (true, true) => Some(p.mounted_selected_row),
@@ -312,7 +318,7 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                             (false, true) => Some(p.selected),
                             _ => None,
                         };
-                        for text in [name, size, format, offset, status] {
+                        for (cell, text) in [name, size, format, offset, status].iter().enumerate() {
                             row.col(|ui| {
                                 // each cell paints its own slice of the row, so the bar has no gaps
                                 if let Some(fill) = fill {
@@ -321,6 +327,14 @@ fn partitions(app: &mut App, ui: &mut egui::Ui) {
                                 }
                                 ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                                     ui.add_space(4.0);
+                                    // the status is the only cell that can carry a verdict, so it is
+                                    // the only one drawn in a colour that means something
+                                    let text = match (cell, tone) {
+                                        (4, Some(Tone::Bad)) => RichText::new(text.as_str()).color(p.bad),
+                                        (4, Some(Tone::Warn)) => RichText::new(text.as_str()).color(p.wait),
+                                        (4, Some(Tone::Good)) => RichText::new(text.as_str()).color(p.good),
+                                        _ => RichText::new(text.as_str()),
+                                    };
                                     ui.add(egui::Label::new(text).truncate());
                                 });
                             });
